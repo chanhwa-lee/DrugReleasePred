@@ -1,0 +1,525 @@
+---
+title: "Empirical Drug Parameter (DK) Prediction"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(readxl)
+library(writexl)
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+library(gridExtra)
+library(signs)
+library(PerformanceAnalytics)
+library(lmtest)
+library(AICcmodavg)
+library(e1071)
+library(randomForest)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+file <- "../data/All_data_summary_final version_confidential_v5_smaller_subsets2_processed.xlsx"
+
+data_excel <- list()
+sheets <- excel_sheets(file)
+for(sheet in sheets){
+  data_sheet <- read_excel(file, sheet = sheet, col_names = T)
+  data_excel[[sheet]] <- data_sheet
+}
+
+data <- rbindlist(data_excel, idcol = T, use.names = T)
+data0 <- data %>% 
+  mutate(base = as.factor(tolower(`Base/salt`)),  
+         MW = as.numeric(MW),
+         CsE = `Cs in excipient (mg/ml)`, CsP = `Cs in PBS (mg/ml)`, 
+         logP = `Log P`, log10DK = log10(DK)) %>%
+  select(.id, base, MW, CsE, CsP, Pka, logP, DK, log10DK)
+
+unique(data0$.id)
+
+train <- data0 %>% filter(.id %in% c("TAFsalt", "TAFbase", "LNG", "ENG", "EFdA", "BIC", "FTC"))
+train
+test  <- data0 %>% filter(.id %in% c("RALsalt", "DTGsalt", "ABC", "3TC"))
+test
+```
+
+
+# Descriptive statistics
+
+## Boxplots and Summary statistics
+
+```{r echo=FALSE}
+summary(train %>% select(-.id, ))
+summary(test  %>% select(-.id, ))
+```
+
+```{r echo=FALSE, fig.height=3, fig.width=15}
+par(mfrow=c(1,7))
+
+boxplot(train$MW, test$MW)
+title("MW")
+
+boxplot(train$CsE, test$CsE)
+title("CsE")
+
+boxplot(train$CsP, test$CsP)
+title("CsP")
+
+boxplot(train$Pka, test$Pka)
+title("Pka")
+
+boxplot(train$logP, test$logP)
+title("logP")
+
+boxplot(train$DK, test$DK)
+title("Dk")
+
+boxplot(train$log10DK, test$log10DK)
+title("log10(Dk)")
+```
+
+-   It seems like fitting linear regression using `log10(Dk)` is better than using the raw `Dk` variable, because the former is distributed more homogeneously.
+
+
+## Spearman correlation plot of variables
+
+```{r echo=FALSE, warning=FALSE}
+# Spearman correlation plot of raw variables
+chart.Correlation(train %>% select(-c(.id,base)), histogram = TRUE, method = "spearman")
+```
+
+- Numbers in the upper triangular cells are Spearman coefficient between two variables
+- `CsE` highly correlated with `Dk`, `Pka` moderately correlated with `DK`
+
+***
+# Linear regression prediction model
+
+## Transformation of Variables
+
+```{r warning=FALSE}
+#####################################################
+# Pearson correlation of transformed variables and log10(DK)
+# raw, power, logarithm, reciprocal transformation are considered
+#####################################################
+
+corr_trans_result <- data.table(var = rep(c("MW", "CsE", "CsP", "Pka", "logP"), each = 4),
+                                trans = rep(c("raw", "power", "logarithm", "reciprocal"), 5),
+                                corr = c(0))
+
+for(varname in c("MW","CsE","CsP","Pka","logP")){
+  raw <- train[[varname]]
+  corr_trans_result[var == varname & trans == "raw", "corr"]        <- cor(raw, train$log10DK)
+  corr_trans_result[var == varname & trans == "power", "corr"]      <- cor(exp(raw), train$log10DK)
+  corr_trans_result[var == varname & trans == "logarithm", "corr"]  <- cor(log(raw), train$log10DK)
+  corr_trans_result[var == varname & trans == "reciprocal", "corr"] <- cor(1/raw, train$log10DK)
+}
+
+corr_trans_result
+```
+
+-   For **Molecular Weight (`MW`)**, power gives the largest (in absolute value) correlation (0.207), but then the scale is too large. **raw** variable is considered instead.
+-   For **solubility in excipient (`CsE`)**, **logarithm** gives the largest (in absolute value) correlation (0.673)
+-   For **solubility in PBS (`CsP`)**, power gives the largest (in absolute value) correlation (0.265), and **raw** gives the second largest correlation (0.247), but **raw*** is considered for simplicity
+-   For **`Pka`**, **reciprocal** gives the largest (in absolute value) correlation (0.171), but **raw** can be considered also.
+-   For **`LogP`**, **raw** variable gives the largest (in absolute value) correlation (0.155)
+
+
+## Linear regression including all variables
+```{r}
+fit.lm.all <- lm(log10DK ~ MW + I(log10(CsE)) + CsP + Pka + logP, data = train)
+summary(fit.lm.all)
+par(mfrow = c(2,2))
+plot(fit.lm.all)
+```
+
+## Prediction Model
+
+$$\text{log}_{10}(\text{Dk}) = -2.052  + 2.923*10^{-3} * \text{MW} - 9.067 * 10^{-1} * \text{log}_{10}(\text{CsE}) + 2.788*10^{-3} * \text{CsP} - 3.196*10^{-2} * \text{Pka} + 4.872 * 10^{-2} * \text{logP} $$
+
+***
+# Figures
+
+### Figure2: Observed vs Predicted log10DK (DK) values scatter plot
+
+```{r echo=FALSE, fig.height=3, fig.width=4}
+
+fit.lm <- lm(log10(DK) ~ MW + I(log10(CsE)) + CsP + logP, data = train)
+
+train$log10DK_pred <- predict(fit.lm, train)
+
+# Train
+drugnames = sort(unique(train$.id))
+
+p.train.log <- ggplot(data = train, aes(x = log10DK, y = log10DK_pred)) +
+  scale_color_manual(name = "Drug",
+                     labels = drugnames,
+                     values = as.factor(drugnames)) + 
+  scale_shape_manual(name = "Drug",
+                     labels = drugnames,
+                     values=1:7) +
+  geom_point(aes(shape=.id, col = .id), size = 1) +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  geom_abline(intercept = -1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = 1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = -0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  geom_abline(intercept = 0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  labs(x = expression(paste("Experimental ",log[10],"(Dk)")), 
+       y = expression(paste("Predicted ",log[10],"(Dk)")), 
+       shape = "Drug")  +
+  scale_x_continuous(limits = c(-3, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(-3, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  theme(aspect.ratio = 1) +
+  theme_bw()
+
+p.train.log
+
+```
+
+
+```{r echo=FALSE, fig.height=3, fig.width=4}
+
+fit.lm <- lm(log10(DK) ~ MW + I(log10(CsE)) + CsP + logP, data = train)
+
+test$log10DK_pred  <- predict(fit.lm, test)
+
+# Test
+drugnames = sort(unique(test$.id))
+
+p.test.log <- ggplot(data = test, aes(x = log10DK, y = log10DK_pred)) +
+  scale_color_manual(name = "Drug",
+                     labels = drugnames,
+                     values = as.factor(drugnames)) + 
+  scale_shape_manual(name = "Drug",
+                     labels = drugnames,
+                     values=7:10) +
+  geom_point(aes(shape=.id, col = .id), size = 1) +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  geom_abline(intercept = -1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = 1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = -0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  geom_abline(intercept = 0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  labs(x = expression(paste("Experimental ",log[10],"(Dk)")), 
+       y = expression(paste("Predicted ",log[10],"(Dk)")), 
+       shape = "Drug")  +
+  scale_x_continuous(limits = c(-3.5, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(-3.5, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  theme(aspect.ratio = 1) +
+  theme_bw()
+
+p.test.log
+```
+
+### Figure S1: Prediction results by drug type
+
+```{r echo=FALSE, fig.height=6, fig.width=11, warning=FALSE}
+### Plot by drug types ###
+
+fit.lm <- lm(log10(DK) ~ MW + I(log10(CsE)) + CsP + logP, data = train)
+
+data1 <- data0 %>% mutate(log10DK_pred = predict(fit.lm, data0), 
+                          DK_pred = 10^log10DK_pred)
+
+draw_pred_plot <- function(id, data1){
+  data1 <- data1 %>% filter(.id == id)
+  p <- ggplot(data = data1) +
+  geom_point(mapping = aes(x = log10DK, y = log10DK_pred), size = 0.8) +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  geom_abline(intercept = -1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = 1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = -0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  geom_abline(intercept = 0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  labs(title = id,
+       x = expression(paste("Experimental ",log[10],"(Dk)")), 
+       y = expression(paste("Predicted ",log[10],"(Dk)")), 
+       shape = "Drug")  +
+  scale_x_continuous(limits = c(-3.5, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(-3.5, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  theme(aspect.ratio = 1) +
+  theme_bw()
+  
+  return(p)
+}
+
+plot_grid(
+    draw_pred_plot("TAFbase", data1),
+    draw_pred_plot("TAFsalt", data1),
+    draw_pred_plot("LNG", data1),
+    draw_pred_plot("ENG", data1),
+    draw_pred_plot("EFdA", data1),
+    draw_pred_plot("BIC", data1),
+    draw_pred_plot("FTC", data1),
+    ncol = 4
+  )
+```
+
+
+### Figure S3: Machine Learning approaches
+
+We also considered Support Vector Machine and Random Forest models to improve the prediction quality, but there were no significant improvement compared to Linear Regression model. 
+Therefore, we ended up with using Linear Regression model as our final prediction model.
+
+```{r include=FALSE}
+
+set.seed(1)
+
+### lm ###
+fit.lm <- lm(log10(DK) ~ MW + I(log10(CsE)) + CsP + logP, data = train)
+
+train$log10DK_pred <- predict(fit.lm, train)
+test$log10DK_pred  <- predict(fit.lm, test)
+
+MSE.lm.train = signif(mean((train$log10DK - predict(fit.lm, train))^2), 4)
+MSE.lm.test  = signif(mean((test$log10DK - predict(fit.lm, test))^2), 4)
+
+# Train
+drugnames = sort(unique(train$.id))
+
+p.lm.train.log <- ggplot(data = train, aes(x = log10DK, y = log10DK_pred)) +
+  scale_color_manual(name = "Drug",
+                     labels = drugnames,
+                     values = as.factor(drugnames)) + 
+  scale_shape_manual(name = "Drug",
+                     labels = drugnames,
+                     values=1:7) +
+  geom_point(aes(shape=.id, col = .id), size = 1) +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  geom_abline(intercept = -1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = 1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = -0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  geom_abline(intercept = 0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  labs(title= paste0("Linear Regression (MSE: ", round(MSE.lm.train,2), ")"),
+       x = expression(paste("Experimental ",log[10],"(Dk)")), 
+       y = expression(paste("Predicted ",log[10],"(Dk)")), 
+       shape = "Drug")  +
+  scale_x_continuous(limits = c(-3, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(-3, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) + 
+  theme(aspect.ratio = 1) +
+  theme_bw()
+
+# Test
+drugnames = sort(unique(test$.id))
+
+p.lm.test.log <- ggplot(data = test, aes(x = log10DK, y = log10DK_pred)) +
+  scale_color_manual(name = "Drug",
+                     labels = drugnames,
+                     values = as.factor(drugnames)) + 
+  scale_shape_manual(name = "Drug",
+                     labels = drugnames,
+                     values=8:11) +
+  geom_point(aes(shape=.id, col = .id), size = 1) +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  geom_abline(intercept = -1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = 1, slope = 1, col = "blue", linetype = "dashed") +
+    geom_abline(intercept = -0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  geom_abline(intercept = 0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  labs(title= paste0("Linear Regression (MSE: ", round(MSE.lm.test, 3), ")"),
+       x = expression(paste("Experimental ",log[10],"(Dk)")), 
+       y = expression(paste("Predicted ",log[10],"(Dk)")), 
+       shape = "Drug")  +
+  scale_x_continuous(limits = c(-3.5, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(-3.5, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) + 
+  theme(aspect.ratio = 1) +
+  theme_bw()
+```
+
+
+```{r include=FALSE}
+### svm ###
+fit.svm <- svm(log10(DK) ~ MW + CsE + CsP + Pka + logP, data = train, 
+               type = "eps-regression", kernel = "radial")
+
+train$log10DK_pred <- predict(fit.svm, train)
+test$log10DK_pred  <- predict(fit.svm, test)
+
+MSE.svm.train = signif(mean((train$log10DK - predict(fit.svm, train))^2), 4)
+MSE.svm.test  = signif(mean((test$log10DK - predict(fit.svm, test))^2), 4)
+
+# Train
+drugnames = sort(unique(train$.id))
+
+p.svm.train.log <- ggplot(data = train, aes(x = log10DK, y = log10DK_pred)) +
+  scale_color_manual(name = "Drug",
+                     labels = drugnames,
+                     values = as.factor(drugnames)) + 
+  scale_shape_manual(name = "Drug",
+                     labels = drugnames,
+                     values=1:7) +
+  geom_point(aes(shape=.id, col = .id), size = 1) +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  geom_abline(intercept = -1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = 1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = -0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  geom_abline(intercept = 0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  labs(title= paste0("Support Vector Machine (MSE: ", round(MSE.svm.train, 2), ")"),
+       x = expression(paste("Experimental ",log[10],"(Dk)")), 
+       y = expression(paste("Predicted ",log[10],"(Dk)")), 
+       shape = "Drug")  +
+  scale_x_continuous(limits = c(-3, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(-3, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  theme(aspect.ratio = 1) +
+  theme_bw()
+
+# Test
+drugnames = sort(unique(test$.id))
+
+p.svm.test.log <- ggplot(data = test, aes(x = log10DK, y = log10DK_pred)) +
+  scale_color_manual(name = "Drug",
+                     labels = drugnames,
+                     values = as.factor(drugnames)) + 
+  scale_shape_manual(name = "Drug",
+                     labels = drugnames,
+                     values=8:11) +
+  geom_point(aes(shape=.id, col = .id), size = 1) +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  geom_abline(intercept = -1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = 1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = -0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  geom_abline(intercept = 0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  labs(title= paste0("SVM (MSE: ",MSE.svm.test, ")"),
+       x = expression(paste("Experimental ",log[10],"(Dk)")), 
+       y = expression(paste("Predicted ",log[10],"(Dk)")), 
+       shape = "Drug")  +
+  scale_x_continuous(limits = c(-3, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(-3, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  theme(aspect.ratio = 1) +
+  theme_bw()
+```
+
+
+```{r include=FALSE}
+### rf ###
+fit.rf <- randomForest(log10DK ~ MW + CsE + CsP + Pka + logP, data = train)
+
+train$log10DK_pred <- predict(fit.rf, train)
+test$log10DK_pred  <- predict(fit.rf, test)
+
+MSE.rf.train = signif(mean((train$log10DK - predict(fit.rf, train))^2), 4)
+MSE.rf.test  = signif(mean((test$log10DK - predict(fit.rf, test))^2), 4)
+
+# Train
+drugnames = sort(unique(train$.id))
+
+p.rf.train.log <- ggplot(data = train, aes(x = log10DK, y = log10DK_pred)) +
+  scale_color_manual(name = "Drug",
+                     labels = drugnames,
+                     values = as.factor(drugnames)) + 
+  scale_shape_manual(name = "Drug",
+                     labels = drugnames,
+                     values=1:7) +
+  geom_point(aes(shape=.id, col = .id), size = 1) +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  geom_abline(intercept = -1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = 1, slope = 1, col = "blue", linetype = "dashed") +
+    geom_abline(intercept = -0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  geom_abline(intercept = 0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  labs(title= paste0("Random Forrest (MSE: ", round(MSE.rf.train,2), ")"),
+       x = expression(paste("Experimental ",log[10],"(Dk)")), 
+       y = expression(paste("Predicted ",log[10],"(Dk)")), 
+       shape = "Drug")  +
+  scale_x_continuous(limits = c(-3, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(-3, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  theme(aspect.ratio = 1) +
+  theme_bw()
+
+# Test
+drugnames = sort(unique(test$.id))
+
+p.rf.test.log <- ggplot(data = test, aes(x = log10DK, y = log10DK_pred)) +
+  scale_color_manual(name = "Drug",
+                     labels = drugnames,
+                     values = as.factor(drugnames)) + 
+  scale_shape_manual(name = "Drug",
+                     labels = drugnames,
+                     values=8:11) +
+  geom_point(aes(shape=.id, col = .id), size = 1) +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  geom_abline(intercept = -1, slope = 1, col = "blue", linetype = "dashed") +
+  geom_abline(intercept = 1, slope = 1, col = "blue", linetype = "dashed") +
+    geom_abline(intercept = -0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  geom_abline(intercept = 0.5, slope = 1, col = "orange", linetype = "dotdash") +
+  labs(title= paste0("RF (MSE: ",MSE.rf.test, ")"),
+       x = expression(paste("Experimental ",log[10],"(Dk)")), 
+       y = expression(paste("Predicted ",log[10],"(Dk)")), 
+       shape = "Drug")  +
+  scale_x_continuous(limits = c(-3, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(-3, 0),
+                     breaks = seq(-3,0),
+                     labels = signs_format(accuracy = 1)) +
+  theme(aspect.ratio = 1) +
+  theme_bw()
+```
+
+
+```{r include=FALSE}
+# Training MSE
+print(MSE.lm.train)
+print(MSE.svm.train)
+print(MSE.rf.train)
+
+# Testing MSE
+print(MSE.lm.test)
+print(MSE.svm.test)
+print(MSE.rf.test)
+```
+
+```{r echo=FALSE, fig.height=4.5, fig.width=11}
+### Comparison Plot ###
+title.train <- ggdraw() + draw_label("Predicted and Observed log10 Dk values", fontface='bold')
+
+p.train <- plot_grid(p.lm.train.log + theme(legend.position = "none"), 
+                p.svm.train.log + theme(legend.position = "none"), 
+                p.rf.train.log + theme(legend.position = "none"), nrow = 1)
+
+plot_grid(
+    p.train, 
+    get_legend(p.lm.train.log + guides(color = guide_legend(nrow = 1)) + theme(legend.position = "bottom")), 
+    ncol = 1, rel_heights = c(0.8, 0.1)
+)
+
+```
